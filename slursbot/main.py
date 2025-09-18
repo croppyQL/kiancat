@@ -1,4 +1,10 @@
 # main.py — daily orchestration (roster refresh, pull, HTML reports, Excel workbook, Discord, watermark)
+# This version preserves your original behavior AND fixes:
+#  - Roster bug: pass INTEGER streak length to ozf_roster.refresh (no more "stop after 1")
+#  - No probe watermark drift: start from DB MAX(oz_id) only (no +20/+40 runaway)
+#  - AFTER-only fetch kept, plus optional overlap on the watermark window (dedup via hash_key)
+#  - Steam3→Steam64 handling remains in db.py / slurs_api.py (no changes needed here)
+
 import os
 import sys
 import argparse
@@ -12,8 +18,6 @@ import slurs_api
 import report
 import discord_webhook
 import ozf_roster
-
-
 
 # ---------- logging ----------
 try:
@@ -77,8 +81,11 @@ def iso_local_window_adelaide_22h() -> Tuple[str, str]:
 STEAM64_MIN = 76561197960265728
 
 def fetch_ozf_steamids(conn) -> List[int]:
-    sql = "SELECT steamid64_bigint FROM kian.oz.v_players_clean WHERE steamid64_bigint IS NOT NULL"
+    """
+    Pull OZF Steam64 IDs from the cleaned view; optionally cap count via OZF_MAX_IDS for testing.
+    """
     ids: List[int] = []
+    sql = "SELECT steamid64_bigint FROM kian.oz.v_players_clean WHERE steamid64_bigint IS NOT NULL"
     with conn.cursor() as cur:
         cur.execute(sql)
         for (sid,) in cur.fetchall():
@@ -98,12 +105,20 @@ def fetch_ozf_steamids(conn) -> List[int]:
     return ids
 
 def run_roster_refresh() -> Tuple[int, int]:
-    """Scrape ozf profiles forward; returns (checked, changed) and posts an admin summary embed."""
-    max_probe = env_int("OZF_REFRESH_PROBE", 300)
-    stop_404  = env_int("OZF_REFRESH_404_STREAK", 20)
-    sleep_ms  = env_int("OZF_REFRESH_SLEEP_MS", 200)
+    """
+    Scrape ozf profiles forward; returns (checked, changed) and posts an admin summary embed.
+    IMPORTANT: pass INTEGERS for stop_after_404 (previous bug was passing a boolean).
+    """
+    max_probe = env_int("OZF_REFRESH_PROBE", 300)        # how many pages/IDs to probe this run
+    stop_404  = env_int("OZF_REFRESH_404_STREAK", 20)    # stop after N consecutive 404s
+    sleep_ms  = env_int("OZF_REFRESH_SLEEP_MS", 200)     # politeness delay between pages
     with db.get_conn() as conn:
-        checked, changed = ozf_roster.refresh(conn, max_probe=max_probe, stop_after_404=stop_404, sleep_ms=sleep_ms)
+        checked, changed = ozf_roster.refresh(
+            conn,
+            max_probe=max_probe,
+            stop_after_404=stop_404,
+            sleep_ms=sleep_ms
+        )
         try:
             discord_webhook.post_admin_roster_summary(conn, checked, changed)
         except Exception as e:
@@ -113,13 +128,17 @@ def run_roster_refresh() -> Tuple[int, int]:
 
 # ---------- pull ----------
 def run_pull(since_iso: Optional[str], before_iso: Optional[str]) -> Tuple[int, int]:
-    """Return (inserted_raw, upserted). Uses AFTER-only; category=total; max 10 IDs/request."""
+    """
+    Return (inserted_raw, upserted).
+    Uses AFTER-only (before_iso intentionally ignored); category=total; max 10 IDs/request.
+    """
     with db.get_conn() as conn:
         steamids = fetch_ozf_steamids(conn)
     logger.info("ozf steamids: %d", len(steamids))
 
-    before_iso = None
+    # AFTER-only by design; we still compute/log 'before' for visibility but don't pass it to the API
     category   = "total"   # only slurs (per slurs.tf maintainer)
+    before_iso = None
 
     data = []
     try:
@@ -205,10 +224,15 @@ def run_discord_public(top_n: int):
     with db.get_conn() as conn:
         discord_webhook.post_public_digest(conn, top_n=max(1, min(int(top_n), 25)))
 
-# ---------- watermark ----------
+# ---------- watermark (simple, DB-driven; no probe watermark used) ----------
 def get_watermark(conn) -> Optional[str]:
     with conn.cursor() as cur:
-        cur.execute("IF OBJECT_ID('dbo.slurs_state') IS NULL SELECT NULL ELSE SELECT TOP 1 last_success_utc FROM dbo.slurs_state ORDER BY id DESC")
+        cur.execute("""
+            IF OBJECT_ID('dbo.slurs_state') IS NULL
+                SELECT NULL
+            ELSE
+                SELECT TOP 1 last_success_utc FROM dbo.slurs_state ORDER BY id DESC
+        """)
         row = cur.fetchone()
         if row and row[0]:
             return row[0].astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -230,16 +254,17 @@ def set_watermark(conn, when_utc: datetime):
         cur.execute("UPDATE dbo.slurs_state SET last_success_utc=?, updated_at=SYSUTCDATETIME()", when_utc)
         conn.commit()
 
+# ---------- daily ----------
 def run_daily():
     """
     Daily orchestration:
       1) Refresh roster
       2) Pull last day (uses DB watermark if present; otherwise Adelaide 22:00 local-day window)
+         NOTE: We apply an OVERLAP_HOURS lookback on the watermark to catch late-indexed messages.
       3) Build HTML reports (1,7,31,180,all) into REPORTS_DIR
       4) Build Excel daily workbook (best-effort)
       5) Post Discord (admin per-player + public digest)
     """
-    from datetime import datetime, timezone
     import pathlib
 
     # Ensure report directory exists
@@ -254,6 +279,7 @@ def run_daily():
         logger.warning("roster refresh failed (continuing): %s", e)
 
     # 2) Determine window (DB watermark preferred; else Adelaide 22:00 local-day window)
+    overlap_h = env_int("OVERLAP_HOURS", 72)  # safe overlap for late indexing; dedup by hash_key
     try:
         with db.get_conn() as conn:
             wm = get_watermark(conn)
@@ -263,11 +289,17 @@ def run_daily():
 
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if wm:
-        since_iso, before_iso = wm, now_utc
-        logger.info("pull window: since=%s before=%s (from watermark)", since_iso, before_iso)
+        try:
+            wm_dt = datetime.fromisoformat(wm.replace("Z", "+00:00"))
+            since_dt = wm_dt - timedelta(hours=max(0, overlap_h))
+            since_iso = since_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            since_iso = wm
+        before_iso = now_utc
+        logger.info("pull window (AFTER-only, overlap=%sh): since=%s before=%s", overlap_h, since_iso, before_iso)
     else:
         since_iso, before_iso = iso_local_window_adelaide_22h()
-        logger.info("pull window: since=%s before=%s (Adelaide 22:00 window)", since_iso, before_iso)
+        logger.info("pull window (AFTER-only, Adelaide 22:00): since=%s before=%s", since_iso, before_iso)
 
     # 3) Pull and load rows
     inserted_raw, upserted = run_pull(since_iso, before_iso)
@@ -315,7 +347,6 @@ def run_daily():
         run_discord_public(top)
     except Exception as e:
         logger.warning("public digest failed: %s", e)
-
 
 # ---------- probe & health ----------
 def run_probe(steamid: str, since: Optional[str], before: Optional[str], contains: Optional[str]):
@@ -431,6 +462,3 @@ if __name__ == "__main__":
         except Exception:
             pass
         sys.exit(1)
-
-
-

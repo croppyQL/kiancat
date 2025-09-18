@@ -2,6 +2,26 @@ import os
 import pyodbc
 from hashlib import sha256
 from dotenv import load_dotenv
+import re
+
+STEAM64_BASE = 76561197960265728
+
+def _steam3_to_steam64(s: str) -> int | None:
+    """
+    Convert like '[U:1:33844719]' or 'U:1:33844719' -> 76561197960265728 + 33844719
+    Returns None if it cannot parse a numeric account id.
+    """
+    if not s:
+        return None
+    # grab the last run of digits in the string
+    m = re.findall(r'(\d+)', str(s))
+    if not m:
+        return None
+    try:
+        account_id = int(m[-1])
+    except Exception:
+        return None
+    return STEAM64_BASE + account_id
 
 load_dotenv()
 CONN_STR = os.environ["SQLSERVER_CONN_STR"]
@@ -55,7 +75,9 @@ def insert_raw_rows(rows, table="dbo.slurs_raw"):
         for r in rows:
             source = r.get("source", "slurs.tf")
             message_id = r.get("message_id")
-            steamid64 = r.get("steamid") or r.get("steamid64")
+            steamid64 = r.get("steamid64")
+            if not (steamid64 and str(steamid64).isdigit() and len(str(steamid64)) == 17):
+                steamid64 = _steam3_to_steam64(str(r.get("steamid") or ""))
             logid = r.get("logid")
             logdate = r.get("logdate") or r.get("msg_time_iso")
             text = r.get("message") or r.get("text")
@@ -95,18 +117,21 @@ def upsert_messages(rows, table="dbo.slurs_msg"):
     with get_conn() as conn, conn.cursor() as cur:
         for r in rows:
             sid = r.get("steamid64") or r.get("steamid")
-            iso = (r.get("msg_time_iso") or r.get("logdate") or "").strip()
+            iso = (r.get("msg_time_iso") or r.get("logdate") or r.get("messagedate") or "").strip()
             text = r.get("text") or r.get("message")
             sid_str = str(sid).strip() if sid is not None else ""
 
+            # Accept only 17-digit Steam64, otherwise attempt Steam3 -> Steam64 conversion
+            if not (sid_str.isdigit() and len(sid_str) == 17):
+                sid64 = _steam3_to_steam64(sid_str) if sid_str else None
+                if sid64 is not None:
+                    sid_str = str(sid64)
+
             if not (sid_str.isdigit() and len(sid_str) == 17):
                 skipped += 1
-                logger.warning("Skipping row: invalid steamid64=%r", sid)
+                logger.warning("Skipping row: bad steamid '%s' (after conversion attempt)", sid)
                 continue
-            if not iso or not text:
-                skipped += 1
-                logger.warning("Skipping row: missing timestamp/text (steamid64=%s)", sid_str)
-                continue
+
 
             logid_raw = r.get("logid")
             try:
