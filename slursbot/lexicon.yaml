@@ -1,0 +1,7 @@
+allow_exact:
+  # - shitter     #commeneted for the moment. need to reserachthis
+  # - bitch
+  # - bastard
+
+# Optional: regex patterns (applied case-insensitively)
+allow_regex: []

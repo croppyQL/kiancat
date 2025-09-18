@@ -1,0 +1,9 @@
+requests
+python-dotenv
+pyodbc
+pandas
+PyYAML
+python-dateutil
+SQLAlchemy
+cloudscraper
+xlsxwriter
