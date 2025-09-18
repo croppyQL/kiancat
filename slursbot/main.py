@@ -13,6 +13,8 @@ import report
 import discord_webhook
 import ozf_roster
 
+
+
 # ---------- logging ----------
 try:
     from logging_setup import setup_logger
@@ -429,3 +431,9 @@ if __name__ == "__main__":
         except Exception:
             pass
         sys.exit(1)
+
+
+
+if __name__ == "__main__":
+    print("sync test: hello from main.py")
+
