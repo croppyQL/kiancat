@@ -19,6 +19,15 @@ import report
 import discord_webhook
 import ozf_roster
 
+
+import glob
+from pathlib import Path
+
+# make sure these resolve (you already created them)
+import report_images
+from discord_webhook import post_report_images_local
+
+
 # ---------------- allowlist/lexicon filtering (post-fetch, pre-write) ----------------
 import re
 try:
@@ -361,6 +370,58 @@ def set_watermark(conn, when_utc: datetime):
         cur.execute("UPDATE dbo.slurs_state SET last_success_utc=?, updated_at=SYSUTCDATETIME()", when_utc)
         conn.commit()
 
+def render_and_post_daily_reports(channel: str = "public") -> None:
+    """
+    Render two specific HTML reports to PNG and post them to Discord in a single message.
+    Files: slurs_summary_1.html, slurs_messages_1d.html (in REPORTS_DIR).
+    """
+    out_dir = reports_dir()
+    wanted_html = ["slurs_summary_1.html", "slurs_messages_1d.html"]
+
+    # Collect the absolute HTML paths that actually exist
+    html_paths = []
+    for name in wanted_html:
+        p = Path(out_dir) / name
+        if p.exists():
+            html_paths.append(str(p))
+        else:
+            logger.warning("Report HTML not found: %s", p)
+
+    if not html_paths:
+        logger.warning("No target reports found in %s; skipping Discord image post.", out_dir)
+        return
+
+    # Render each HTML to PNG (report_images.render_html_to_pngs accepts a glob-style pattern)
+    rendered_pngs = []
+    for html_path in html_paths:
+        # Use the exact filename as the pattern; renderer will make <name>.png in out_dir
+        rendered = report_images.render_html_to_pngs(
+            report_dir=out_dir,
+            pattern=Path(html_path).name,   # exact file
+            out_dir=out_dir,
+            width=1280,
+            full_page=True,
+            timeout_ms=45000
+        )
+        rendered_pngs.extend(rendered)
+
+    # Keep only the two we care about, in a stable order
+    rendered_pngs = [str(Path(out_dir) / "slurs_summary_1.png"),
+                     str(Path(out_dir) / "slurs_messages_1d.png")]
+    # Filter to those that exist
+    rendered_pngs = [p for p in rendered_pngs if Path(p).exists()]
+
+    if not rendered_pngs:
+        logger.warning("No PNGs produced for target reports; skipping Discord image post.")
+        return
+
+    # Post both images in a single message
+    try:
+        post_report_images_local(rendered_pngs[:2], channel=channel, message="Daily reports")
+        logger.info("Posted report images to Discord (%s): %s", channel, ", ".join(Path(p).name for p in rendered_pngs[:2]))
+    except Exception as e:
+        logger.warning("Discord post (report images) failed: %s", e)
+
 # ---------- daily ----------
 def run_daily():
     """
@@ -420,6 +481,11 @@ def run_daily():
         logger.info("reports written to %s", out_dir)
     except Exception as e:
         logger.warning("report generation failed: %s", e)
+    # 4b) Render & post the two key reports as images to Discord (public)
+    try:
+        render_and_post_daily_reports(channel=os.getenv("REPORTS_DISCORD_CHANNEL", "public"))
+    except Exception as e:
+        logger.warning("auto-post of report images failed: %s", e)
 
     # 5) Excel (ok if empty)
     try:
@@ -508,7 +574,7 @@ def parse_args():
     sp.add_argument("--since", type=str, default=None, help="ISO8601 UTC start (e.g., 2025-09-15T00:00:00Z)")
     sp.add_argument("--before", type=str, default=None, help="ISO8601 UTC end   (e.g., 2025-09-16T00:00:00Z)")
 
-    sp = subs.add_parser("report", help="Build HTML reports from SQL (kept as-is)")
+    sp = subs.add_parser("report", help="Build HTML reports from SQL")
     sp.add_argument("--mode", choices=["1","7","31","180","all"], default="180")
 
     subs.add_parser("discord-post", help="Post the admin/private per-player daily embeds")
@@ -518,13 +584,25 @@ def parse_args():
     subs.add_parser("roster-refresh", help="Refresh ozfortress roster before pulling")
     subs.add_parser("run-daily", help="Refresh roster, pull, HTML+Excel, Discord, watermark")
     subs.add_parser("daily", help="Alias for run-daily")
+
     sp = subs.add_parser("probe", help="Probe one SteamID for a window")
-    sp.add_argument("--steamid", required=True); sp.add_argument("--since", type=str, default=None)
-    sp.add_argument("--before", type=str, default=None); sp.add_argument("--contains", type=str, default=None)
+    sp.add_argument("--steamid", required=True)
+    sp.add_argument("--since", type=str, default=None)
+    sp.add_argument("--before", type=str, default=None)
+    sp.add_argument("--contains", type=str, default=None)
+
     subs.add_parser("health", help="Check DB + API connectivity")
+
+    # SINGLE simple poster: renders slurs_summary_1 + slurs_messages_1d and posts to Discord
+    subs.add_parser("discord-report", help="Render slurs_summary_1 + slurs_messages_1d to PNG and post to Discord")
 
     return p.parse_args()
 
+
+
+    return p.parse_args()
+
+# ---------- entry ----------
 # ---------- entry ----------
 if __name__ == "__main__":
     load_dotenv()
@@ -532,22 +610,35 @@ if __name__ == "__main__":
     try:
         if args.cmd == "pull":
             run_pull(args.since, args.before)
+
         elif args.cmd == "report":
             run_report(mode=args.mode)
+
         elif args.cmd == "discord-post":
             run_discord_admin()
+
         elif args.cmd == "discord-public":
             run_discord_public(args.top)
+
+        elif args.cmd == "discord-report":
+            # renders slurs_summary_1.html + slurs_messages_1d.html to PNG and posts to Discord
+            render_and_post_daily_reports(channel=os.getenv("REPORTS_DISCORD_CHANNEL", "public"))
+
         elif args.cmd == "roster-refresh":
             run_roster_refresh()
-        elif args.cmd in ("run-daily","daily"):
+
+        elif args.cmd in ("run-daily", "daily"):
             run_daily()
+
         elif args.cmd == "probe":
             run_probe(args.steamid, args.since, args.before, args.contains)
+
         elif args.cmd == "health":
             run_health()
+
         else:
             sys.exit(2)
+
     except KeyboardInterrupt:
         logger.warning("Interrupted by user"); sys.exit(130)
     except Exception:
@@ -557,3 +648,37 @@ if __name__ == "__main__":
         except Exception:
             pass
         sys.exit(1)
+
+
+def run_discord_report(pattern: str, limit: int, channel: str, source: str, github_prefix: str):
+    out_dir = reports_dir()
+
+    if source == "local":
+        # 1) Render HTML to PNG (idempotent; overwrites png if exists)
+        try:
+            import report_images  # local module
+        except Exception as e:
+            logger.error("report_images import failed: %s", e)
+            raise
+        pngs = report_images.render_html_to_pngs(out_dir, pattern=pattern, out_dir=out_dir)
+        # 2) Post a subset
+        from discord_webhook import post_report_images_local
+        pngs = sorted(pngs)[-limit:] if limit > 0 else pngs
+        if not pngs:
+            logger.warning("No PNGs to post (pattern=%s). Did you generate reports?", pattern)
+            return
+        post_report_images_local(pngs, channel=channel, message=f"Reports ({pattern})")
+
+    else:  # source == "github"
+        # Expect pre-rendered PNGs already in your repo at github_prefix
+        # We'll list local HTMLs to derive PNG names, then map to URLs.
+        import glob, os
+        htmls = sorted(glob.glob(os.path.join(out_dir, pattern)))
+        names = [os.path.splitext(os.path.basename(h))[0] + ".png" for h in htmls]
+        urls = [github_prefix.rstrip("/") + "/" + n for n in names]
+        urls = urls[-limit:] if limit > 0 else urls
+        from discord_webhook import post_report_image_urls
+        if not urls:
+            logger.warning("No URLs to post (pattern=%s).", pattern)
+            return
+        post_report_image_urls(urls, channel=channel, message=f"Reports ({pattern})")

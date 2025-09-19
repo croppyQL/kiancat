@@ -7,3 +7,4 @@ python-dateutil
 SQLAlchemy
 cloudscraper
 xlsxwriter
+playwright>=1.45

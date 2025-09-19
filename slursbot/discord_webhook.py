@@ -230,3 +230,52 @@ def post_error(text: str):
     max_len=1900
     s = text if len(text)<=max_len else text[:max_len-1]+"…"
     _post(url, {"embeds":[{"title":"Error","description":s,"color":_red()}]})
+
+
+# --- image report posting helpers ---
+import os, requests #alr in but no point not having it again.
+
+def _choose_webhook(channel: str = "public") -> str:
+    """
+    channel: 'public' or 'admin'
+    """
+    if channel.lower() == "admin":
+        url = os.getenv("DISCORD_ADMIN_WEBHOOK_URL")
+    else:
+        url = os.getenv("DISCORD_PUBLIC_WEBHOOK_URL")
+    if not url:
+        raise RuntimeError(f"Missing webhook for channel={channel}. "
+                           f"Set DISCORD_PUBLIC_WEBHOOK_URL or DISCORD_ADMIN_WEBHOOK_URL.")
+    return url
+
+def post_report_images_local(png_paths, channel: str = "public", message: str | None = None) -> None:
+    """
+    Upload one or more local PNGs to Discord so they render inline.
+    """
+    url = _choose_webhook(channel)
+    # Discord: one message can carry multiple files; keep it modest (<=8)
+    png_paths = list(png_paths)[:8]
+    if not png_paths:
+        return
+
+    # Upload in a single message with optional text
+    files = []
+    for i, path in enumerate(png_paths):
+        files.append(("files[%d]" % i, (os.path.basename(path), open(path, "rb"), "image/png")))
+    data = {"content": message or ""}
+    r = requests.post(url, data=data, files=files, timeout=60)
+    r.raise_for_status()
+
+def post_report_image_urls(image_urls, channel: str = "public", message: str | None = None) -> None:
+    """
+    Post external image URLs (e.g., raw GitHub PNGs) as embeds so Discord displays them inline.
+    """
+    url = _choose_webhook(channel)
+    image_urls = list(image_urls)[:10]
+    for img in image_urls:
+        data = {
+            "content": message or "",
+            "embeds": [{"image": {"url": img}}]
+        }
+        r = requests.post(url, json=data, timeout=30)
+        r.raise_for_status()
