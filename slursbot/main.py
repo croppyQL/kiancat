@@ -19,6 +19,104 @@ import report
 import discord_webhook
 import ozf_roster
 
+# ---------------- allowlist/lexicon filtering (post-fetch, pre-write) ----------------
+import re
+try:
+    import yaml
+except Exception:
+    yaml = None
+
+def _load_word_list_yaml(path: str, keys=("words", "allow", "allowlist")) -> list[str]:
+    if not path:
+        return []
+    try:
+        if yaml is None:
+            logger.warning("PyYAML not installed; cannot load %s", path)
+            return []
+        if not os.path.exists(path):
+            logger.warning("allow/lexicon file not found: %s", path)
+            return []
+        with open(path, "r", encoding="utf-8") as f:
+            doc = yaml.safe_load(f)
+        words: list[str] = []
+        if isinstance(doc, list):
+            words = [str(x).strip().lower() for x in doc if str(x).strip()]
+        elif isinstance(doc, dict):
+            for k in keys:
+                if isinstance(doc.get(k), list):
+                    words.extend([str(x).strip().lower() for x in doc[k] if str(x).strip()])
+        # de-dup and sort for repeatable logs
+        return sorted(set(words))
+    except Exception as e:
+        logger.warning("Failed to load %s: %s", path, e)
+        return []
+
+def _compile_word_re(words: list[str]) -> re.Pattern | None:
+    if not words:
+        return None
+    # Word-boundary OR pattern, escape each word
+    # \b is OK for simple word tokens; if you add punctuation words, we can extend later.
+    pat = r"\b(?:" + "|".join(re.escape(w) for w in words) + r")\b"
+    try:
+        return re.compile(pat, re.IGNORECASE)
+    except Exception as e:
+        logger.warning("Regex compile failed: %s", e)
+        return None
+
+def _apply_allowlist_filter(rows: list[dict]) -> tuple[list[dict], dict]:
+    """
+    Keep rows that:
+      - contain any 'slur' from lexicon (always keep), OR
+      - contain none of the allowlist words.
+
+    Drop rows that:
+      - contain allowlist words AND contain no known slur words.
+
+    This guarantees that messages with both allowed words and slurs are KEPT.
+
+    Controlled by:
+      ALLOWLIST_PATH (default 'allowlist.yaml')
+      LEXICON_PATH   (default 'lexicon.yaml')
+      ALLOWLIST_DROP (default '0' = off; set '1' to drop)
+    """
+    allow_path = os.getenv("ALLOWLIST_PATH", "allowlist.yaml")
+    lex_path   = os.getenv("LEXICON_PATH",   "lexicon.yaml")
+    do_drop    = os.getenv("ALLOWLIST_DROP", "0").strip().lower() in {"1","true","yes","on"}
+
+    allow_words = _load_word_list_yaml(allow_path, keys=("words","allow","allowlist"))
+    lex_words   = _load_word_list_yaml(lex_path,   keys=("words","terms","slurs","deny","denylist"))
+
+    allow_re = _compile_word_re(allow_words) if allow_words else None
+    slur_re  = _compile_word_re(lex_words)   if lex_words else None
+
+    if not do_drop or (allow_re is None):
+        # Nothing to do (feature off or no allowlist words)
+        return rows, {"enabled": False, "allow_terms": len(allow_words), "lex_terms": len(lex_words), "dropped": 0, "kept": len(rows)}
+
+    kept: list[dict] = []
+    dropped = 0
+
+    for r in rows:
+        msg = (r.get("message") or r.get("text") or "")
+        t = str(msg)
+
+        # If we can positively identify a slur term from lexicon -> keep
+        if slur_re is not None and slur_re.search(t):
+            kept.append(r)
+            continue
+
+        # Otherwise, if allowlist is present in the text -> drop
+        if allow_re.search(t):
+            dropped += 1
+            continue
+
+        # Neither slur nor allow term -> keep as-is
+        kept.append(r)
+
+    return kept, {"enabled": True, "allow_terms": len(allow_words), "lex_terms": len(lex_words), "dropped": dropped, "kept": len(kept)}
+
+
+
 # ---------- logging ----------
 try:
     from logging_setup import setup_logger
@@ -131,14 +229,14 @@ def run_pull(since_iso: Optional[str], before_iso: Optional[str]) -> Tuple[int, 
     """
     Return (inserted_raw, upserted).
     Uses AFTER-only (before_iso intentionally ignored); category=total; max 10 IDs/request.
-    """
+    """ 
     with db.get_conn() as conn:
         steamids = fetch_ozf_steamids(conn)
     logger.info("ozf steamids: %d", len(steamids))
 
     # AFTER-only by design; we still compute/log 'before' for visibility but don't pass it to the API
     category   = "total"   # only slurs (per slurs.tf maintainer)
-    before_iso = None
+
 
     data = []
     try:
@@ -165,6 +263,14 @@ def run_pull(since_iso: Optional[str], before_iso: Optional[str]) -> Tuple[int, 
             limit=env_int("SLURS_LIMIT", 100),
             sleep_ms=env_int("SLURS_SLEEP_MS", 1100),
             retries_s=env_list_int("SLURS_RETRIES_S", [10, 30, 300, 900]),
+        )
+
+        # OPTIONAL allowlist filter (off by default). Drops rows that contain only allowed words.
+    data, af_stats = _apply_allowlist_filter(data)
+    if af_stats.get("enabled"):
+        logger.info(
+            "allowlist filter active: allow_terms=%s lex_terms=%s dropped=%s kept=%s",
+            af_stats["allow_terms"], af_stats["lex_terms"], af_stats["dropped"], af_stats["kept"]
         )
 
     if not data:
@@ -199,17 +305,18 @@ def run_pull(since_iso: Optional[str], before_iso: Optional[str]) -> Tuple[int, 
 def run_report(mode: str = "180"):
     out_dir = reports_dir()
     with db.get_conn() as conn:
+        # preferred: (conn, out_dir, mode=...)
         try:
-            report.make_reports(
-                conn,
-                out_dir,
-                tz_name=os.getenv("DISPLAY_TZ", "Australia/Adelaide"),
-                window_days=int(os.getenv("REPORT_WINDOW_DAYS", "180")),
-                mode=mode,
-            )
+            report.make_reports(conn, out_dir, mode=mode)
         except TypeError:
-            report.make_reports(conn, out_dir)
+            # some versions take (conn, out_dir, mode) positionally
+            try:
+                report.make_reports(conn, out_dir, mode)
+            except TypeError:
+                # last-resort: very old signature (conn, out_dir) only
+                report.make_reports(conn, out_dir)
     logger.info("HTML reports written to %s (mode=%s)", out_dir, mode)
+
 
 # ---------- Discord ----------
 def run_discord_admin():
@@ -279,27 +386,15 @@ def run_daily():
         logger.warning("roster refresh failed (continuing): %s", e)
 
     # 2) Determine window (DB watermark preferred; else Adelaide 22:00 local-day window)
-    overlap_h = env_int("OVERLAP_HOURS", 72)  # safe overlap for late indexing; dedup by hash_key
-    try:
-        with db.get_conn() as conn:
-            wm = get_watermark(conn)
-    except Exception as e:
-        logger.warning("watermark lookup failed: %s", e)
-        wm = None
+    # 2) Determine window: strictly last LOOKBACK_HOURS from *now* (default 25)
+    LOOKBACK_HOURS = env_int("LOOKBACK_HOURS", 25)
+    now_dt = datetime.now(timezone.utc)
+    since_dt = now_dt - timedelta(hours=max(1, LOOKBACK_HOURS))
+    since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    before_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    if wm:
-        try:
-            wm_dt = datetime.fromisoformat(wm.replace("Z", "+00:00"))
-            since_dt = wm_dt - timedelta(hours=max(0, overlap_h))
-            since_iso = since_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        except Exception:
-            since_iso = wm
-        before_iso = now_utc
-        logger.info("pull window (AFTER-only, overlap=%sh): since=%s before=%s", overlap_h, since_iso, before_iso)
-    else:
-        since_iso, before_iso = iso_local_window_adelaide_22h()
-        logger.info("pull window (AFTER-only, Adelaide 22:00): since=%s before=%s", since_iso, before_iso)
+    logger.info("pull window (last %sh): since=%s before=%s", LOOKBACK_HOURS, since_iso, before_iso)
+
 
     # 3) Pull and load rows
     inserted_raw, upserted = run_pull(since_iso, before_iso)

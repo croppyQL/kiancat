@@ -215,7 +215,7 @@ def _player_links(row) -> str:
     ozid = row.get("oz_id")
     sid  = row.get("steamid64")
     oz   = f"https://ozfortress.com/users/{int(ozid)}" if pd.notna(ozid) else None
-    sl   = f"https://slurs.tf/steamid/{int(sid)}" if pd.notna(sid) else None
+    sl   = f"https://slurs.tf/player?steamid={int(sid)}" if pd.notna(sid) else None
     st   = f"https://steamcommunity.com/profiles/{int(sid)}" if pd.notna(sid) else None
     links = []
     if oz: links.append(f'<a href="{oz}" target="_blank">ozf</a>')
