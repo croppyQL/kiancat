@@ -17,7 +17,7 @@
 /slursbot/**
 
 # Re-add ONLY these files
-!/slursbot/.env
+# !/slursbot/.env           # discord token n shi 
 !/slursbot/config.ymal       # included as you wrote it
 !/slursbot/config.yaml       # also include in case of typo
 !/slursbot/db.py
