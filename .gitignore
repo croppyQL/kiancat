@@ -1,25 +1,20 @@
-﻿# Ignore EVERYTHING by default
-**
+﻿# --- Always ignore local venv, caches, misc ---
+/slursbot/.venv/
+/slursbot/__pycache__/
+/slursbot/old stuff/
 
-# Keep this file
-!.gitignore
-
-# --- Keep ALL of C:\slurs\reports ---
+# --- Keep ALL of C:\slurs\reports (tracked) ---
 !/reports/
 !/reports/**
 
-# --- In C:\slurs\slursbot: allow only the files below ---
-
-# First, allow the slursbot directory so rules can match inside it
+# --- Only track selected files in slursbot ---
+# Start by allowing dir so we can re-include files inside it
 !/slursbot/
-
-# Then ignore everything inside slursbot by default
+# Ignore everything under slursbot by default
 /slursbot/**
 
-# Re-add ONLY these files
-# !/slursbot/.env           # discord token n shi 
-!/slursbot/config.ymal       # included as you wrote it
-!/slursbot/config.yaml       # also include in case of typo
+# Re-include ONLY these files
+!/slursbot/config.yaml
 !/slursbot/db.py
 !/slursbot/discord_webhook.py
 !/slursbot/global_report.py
@@ -30,9 +25,10 @@
 !/slursbot/report.py
 !/slursbot/requirements.txt
 !/slursbot/slurs_api.py
+!/slursbot/discord_bot.py
+!/slursbot/.env.public
 
-# (These are redundant given /slursbot/** above, but listed for clarity)
-# Keep junk ignored in slursbot
-/slursbot/.venv/
-/slursbot/__pycache__/
-/slursbot/old stuff/
+# --- Never commit secrets ---
+/slursbot/.env
+/slursbot/.env.secrets
+/slursbot/.env.*.local

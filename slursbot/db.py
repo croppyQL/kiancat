@@ -3,35 +3,67 @@ import pyodbc
 from hashlib import sha256
 from dotenv import load_dotenv
 import re
+import os
+import logging
+from hashlib import sha256
+from typing import Iterable, List, Dict, Any, Optional
+
+import pyodbc
 
 STEAM64_BASE = 76561197960265728
 
-def _steam3_to_steam64(s: str) -> int | None:
-    """
-    Convert like '[U:1:33844719]' or 'U:1:33844719' -> 76561197960265728 + 33844719
-    Returns None if it cannot parse a numeric account id.
-    """
-    if not s:
-        return None
-    # grab the last run of digits in the string
-    m = re.findall(r'(\d+)', str(s))
-    if not m:
-        return None
-    try:
-        account_id = int(m[-1])
-    except Exception:
-        return None
-    return STEAM64_BASE + account_id
+# db.py — DB helpers for slursbot
 
-load_dotenv()
-CONN_STR = os.environ["SQLSERVER_CONN_STR"]
+logger = logging.getLogger("slursbot")
+
+# ---- env loading early (so importers see vars) ----
+def _load_env():
+    try:
+        from env_loader import load as _load
+        _load()
+    except Exception:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except Exception:
+            pass
+
+_load_env()
+
+# ---- connection string resolution ----
+def _resolve_conn_str() -> str:
+    conn = os.getenv("SQLSERVER_CONN_STR")
+    if conn:
+        return conn
+    # Fallback: build from pieces if provided
+    server   = os.getenv("DB_SERVER")
+    database = os.getenv("DB_DATABASE")
+    user     = os.getenv("DB_USER")
+    password = os.getenv("DB_PASSWORD")
+    if all([server, database, user, password]):
+        return (
+            "Driver={ODBC Driver 18 for SQL Server};"
+            f"Server={server};Database={database};"
+            f"UID={user};PWD={password};"
+            "Encrypt=yes;TrustServerCertificate=yes;"
+        )
+    raise RuntimeError(
+        "Missing SQL connection info. Set SQLSERVER_CONN_STR or DB_SERVER/DB_DATABASE/DB_USER/DB_PASSWORD "
+        "in .env.secrets"
+    )
+
+CONN_STR = _resolve_conn_str()
 
 def get_conn():
     return pyodbc.connect(CONN_STR)
 
-def get_ozf_steamids():
+# ---- roster helpers (some code uses this) ----
+def get_ozf_steamids() -> List[str]:
+    """
+    Legacy helper: returns steamid64 strings from kian.oz.players.
+    """
     sql = "SELECT steamid64 FROM kian.oz.players WHERE steamid64 IS NOT NULL"
-    good = []
+    good: List[str] = []
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(sql)
         for (sid,) in cur.fetchall():
@@ -40,28 +72,14 @@ def get_ozf_steamids():
                 good.append(s)
     return good
 
-# --- add this whole function to db.py ---
-def get_sql_conn():
+# ---- raw ingest ----
+def insert_raw_rows(rows: List[Dict[str, Any]], table: str = "dbo.slurs_raw") -> int:
     """
-    Open a SQL Server connection using the .env value SQLSERVER_CONN_STR.
-    Returns a live pyodbc connection. Raises a clear error if the variable is missing.
+    Insert original API rows into a raw table for auditing.
+    Expected columns in the target table:
+      source nvarchar, message_id nvarchar, steamid64 bigint, logid bigint,
+      logdate_txt nvarchar, text nvarchar, payload_json nvarchar(max)
     """
-    import os
-    from dotenv import load_dotenv
-    load_dotenv()  # lets us read .env without exporting env vars in the shell
-    conn_str = os.environ.get("SQLSERVER_CONN_STR")
-    if not conn_str:
-        raise RuntimeError(
-            "SQLSERVER_CONN_STR is not set. Put your full ODBC connection string in .env, e.g.\n"
-            'SQLSERVER_CONN_STR=DRIVER={ODBC Driver 18 for SQL Server};SERVER=server;DATABASE=db;UID=user;PWD=pass;Encrypt=yes;TrustServerCertificate=yes'
-        )
-    import pyodbc
-    # autocommit False lets your existing code manage transactions if it already does
-    return pyodbc.connect(conn_str, autocommit=False)
-# --- end add ---
-
-
-def insert_raw_rows(rows, table="dbo.slurs_raw"):
     if not rows:
         return 0
     sql = f"""
@@ -69,50 +87,56 @@ def insert_raw_rows(rows, table="dbo.slurs_raw"):
       (source, message_id, steamid64, logid, logdate_txt, text, payload_json)
     VALUES (?,?,?,?,?,?,?)
     """
+    inserted = 0
     with get_conn() as conn, conn.cursor() as cur:
-        try: cur.fast_executemany = True
-        except Exception: pass
+        try:
+            cur.fast_executemany = True
+        except Exception:
+            pass
         for r in rows:
-            source = r.get("source", "slurs.tf")
+            source   = r.get("source", "slurs.tf")
             message_id = r.get("message_id")
-            steamid64 = r.get("steamid64")
-            if not (steamid64 and str(steamid64).isdigit() and len(str(steamid64)) == 17):
-                steamid64 = _steam3_to_steam64(str(r.get("steamid") or ""))
-            logid = r.get("logid")
-            logdate = r.get("logdate") or r.get("msg_time_iso")
-            text = r.get("message") or r.get("text")
-            payload_json = r.get("payload_json")
-            cur.execute(sql,
-                        source,
-                        message_id,
-                        str(steamid64) if steamid64 is not None else None,
-                        str(logid) if logid is not None else None,
-                        str(logdate) if logdate is not None else None,
-                        text,
-                        payload_json)
-        conn.commit()
-        return len(rows)
+            steamid64  = r.get("steamid") or r.get("steamid64")
+            logid      = r.get("logid")
+            logdate    = r.get("logdate") or r.get("msg_time_iso") or r.get("messagedate")
+            text       = r.get("message") or r.get("text")
+            payload    = r.get("payload_json")
 
-def upsert_messages(rows, table="dbo.slurs_msg"):
+            cur.execute(
+                sql,
+                source,
+                message_id,
+                int(steamid64) if steamid64 is not None and str(steamid64).strip().isdigit() else None,
+                int(logid) if logid is not None and str(logid).strip().isdigit() else None,
+                str(logdate) if logdate is not None else None,
+                text,
+                payload
+            )
+            inserted += 1
+        conn.commit()
+    return inserted
+
+# ---- typed upsert (dedupe by hash_key) ----
+def upsert_messages(rows: List[Dict[str, Any]], table: str = "dbo.slurs_msg") -> int:
     """
     Accepts either:
-      - {'steamid','message','logdate','logid'}  (shape from slurs_api)
+      - {'steamid','message','logdate','logid'}  (slurs_api shape)
       - {'steamid64','text','msg_time_iso','logid'} (older shape)
-    Uses SHA256(steamid64|iso|text) as dedupe key.
+    Uses SHA256(steamid64|iso|text) as dedupe key stored in hash_key.
     """
-    import logging
-    logger = logging.getLogger("slursbot")
     if not rows:
         return 0
+
+    import logging
+    logger = logging.getLogger("slursbot")
 
     sql = f"""
     IF NOT EXISTS (SELECT 1 FROM {table} WHERE hash_key = ?)
     INSERT INTO {table} (message_id, steamid64, logid, msg_time_utc, text, hash_key)
     VALUES (?,?,?,?,?,?)
     """
-
     inserted = 0
-    skipped = 0
+    skipped  = 0
 
     with get_conn() as conn, conn.cursor() as cur:
         for r in rows:
@@ -121,17 +145,14 @@ def upsert_messages(rows, table="dbo.slurs_msg"):
             text = r.get("text") or r.get("message")
             sid_str = str(sid).strip() if sid is not None else ""
 
-            # Accept only 17-digit Steam64, otherwise attempt Steam3 -> Steam64 conversion
-            if not (sid_str.isdigit() and len(sid_str) == 17):
-                sid64 = _steam3_to_steam64(sid_str) if sid_str else None
-                if sid64 is not None:
-                    sid_str = str(sid64)
-
             if not (sid_str.isdigit() and len(sid_str) == 17):
                 skipped += 1
-                logger.warning("Skipping row: bad steamid '%s' (after conversion attempt)", sid)
+                logger.warning("Skipping row: invalid steamid64=%r", sid)
                 continue
-
+            if not iso or not text:
+                skipped += 1
+                logger.warning("Skipping row: missing timestamp/text (steamid64=%s)", sid_str)
+                continue
 
             logid_raw = r.get("logid")
             try:
@@ -162,8 +183,7 @@ def upsert_messages(rows, table="dbo.slurs_msg"):
 
     return inserted
 
-# ---------------------- OZF ROSTER HELPERS ----------------------
-
+# ---- ozfortress players upsert ----
 def get_max_oz_id(conn) -> int:
     """
     Returns MAX(oz_id) from kian.oz.players, or 0 if table empty.
@@ -177,10 +197,10 @@ def get_max_oz_id(conn) -> int:
         except Exception:
             return 0
 
-def upsert_oz_players(conn, rows):
+def upsert_oz_players(conn, rows: List[Dict[str, Any]]) -> int:
     """
     rows: list of dicts with:
-      {'oz_id':str/int, 'steamid64':str(17) or None,
+      {'oz_id':str|int, 'steamid64':str(17) or None,
        'current_name':str|None, 'oz_profile_url':str|None, 'steam_profile_url':str|None}
 
     Upserts on oz_id. Ensures current_name is NEVER NULL (uses 'ozf_user_<oz_id>' fallback).
@@ -202,18 +222,20 @@ def upsert_oz_players(conn, rows):
     WHEN MATCHED THEN
       UPDATE SET
         tgt.steamid64         = COALESCE(src.steamid64, tgt.steamid64),
-        -- only overwrite name when we have a non-empty one
         tgt.current_name      = CASE WHEN NULLIF(LTRIM(RTRIM(src.current_name)),'') IS NOT NULL
                                      THEN LTRIM(RTRIM(src.current_name))
                                      ELSE tgt.current_name END,
         tgt.oz_profile_url    = COALESCE(src.oz_profile_url, tgt.oz_profile_url),
         tgt.steam_profile_url = COALESCE(src.steam_profile_url, tgt.steam_profile_url),
-        tgt.updated_at        = SYSUTCDATETIME(),
-        tgt.last_checked_at   = SYSUTCDATETIME()
-    WHEN NOT MATCHED BY TARGET THEN
-      INSERT (oz_id, steamid64, current_name, oz_profile_url, steam_profile_url, created_at, updated_at, last_checked_at)
-      VALUES (src.oz_id, src.steamid64, src.current_name, src.oz_profile_url, src.steam_profile_url,
-              SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME());
+        tgt.updated_at        = SYSUTCDATETIME()
+    WHEN NOT MATCHED THEN
+      INSERT (oz_id, steamid64, current_name, oz_profile_url, steam_profile_url, created_at, updated_at)
+      VALUES (src.oz_id,
+              src.steamid64,
+              LTRIM(RTRIM(COALESCE(NULLIF(src.current_name,''), CONCAT('ozf_user_', CAST(src.oz_id AS NVARCHAR(32)))))),
+              src.oz_profile_url,
+              src.steam_profile_url,
+              SYSUTCDATETIME(), SYSUTCDATETIME());
     """
 
     count = 0
@@ -224,20 +246,14 @@ def upsert_oz_players(conn, rows):
             pass
 
         for r in rows:
-            oz_id_raw = r.get("oz_id")
+            oz_id = r.get("oz_id")
             steamid = r.get("steamid64")
             if not steamid:
-                # skip profiles without a Steam link
+                # No steam ID, nothing to store (skip)
                 continue
 
-            # Ensure oz_id is a simple int
-            try:
-                oz_id = int(str(oz_id_raw).strip())
-            except Exception:
-                continue
-
-            # NEVER pass NULL for current_name (table is NOT NULL)
-            name = (r.get("current_name") or "").strip()
+            nm = r.get("current_name") or ""
+            name = nm.strip()
             if not name:
                 name = f"ozf_user_{oz_id}"
 
@@ -245,12 +261,12 @@ def upsert_oz_players(conn, rows):
                 sql,
                 str(oz_id),
                 str(steamid),
-                name,                              # guaranteed non-empty string
+                name,
                 (r.get("oz_profile_url") or None),
                 (r.get("steam_profile_url") or None),
             )
-            # rowcount can be 0 for MATCH without change; we still consider it processed
             count += 1
 
         conn.commit()
+
     return count

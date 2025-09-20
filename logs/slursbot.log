@@ -1,0 +1,7 @@
+2025-09-18 09:17:23,272 ERROR job failed
+Traceback (most recent call last):
+  File "C:\slurs\slursbot\main.py", line 448, in <module>
+    run_daily()
+  File "C:\slurs\slursbot\main.py", line 240, in run_daily
+    from logging_setup import logger
+ImportError: cannot import name 'logger' from 'logging_setup' (C:\slurs\slursbot\logging_setup.py)

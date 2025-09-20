@@ -1,0 +1,26 @@
+timezone: "Australia/Adelaide"      # run & reports use Adelaide local
+daily_summary_time_local: "22:00"   # 10:00pm Adelaide
+
+slurs_api:
+  endpoint: "/api/messages"
+  #category: "total"
+  batch_size: 10
+  sleep_ms: 500
+  limit: 100
+  retries: [10, 30, 300, 900]
+
+
+tables:
+  raw: "dbo.slurs_raw"
+  msg: "dbo.slurs_msg"
+  ozf_players: "kian.oz.players"
+
+reports:
+  out_dir: "C:/slurs/reports"
+  keep_days: 36500           # 100 years
+
+discord:
+  color_hex: "#A7C7E7"      # pastel :p
+  max_top_players: 10
+
+window_days_summary: 180     # trend window
